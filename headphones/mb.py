@@ -44,7 +44,7 @@ def startmb():
         mbport = int(headphones.CUSTOMPORT)
         sleepytime = int(headphones.CUSTOMSLEEP)
     elif headphones.MIRROR == "headphones":
-        mbhost = "192.30.34.130"
+        mbhost = "144.76.94.239"
         mbport = 8181
         mbuser = headphones.HPUSER
         mbpass = headphones.HPPASS
@@ -318,7 +318,10 @@ def getRelease(releaseid, include_artist_info=True):
             if 'release-group' in results:
                 release['rgid'] = unicode(results['release-group']['id'])
                 release['rg_title'] = unicode(results['release-group']['title'])
-                release['rg_type'] = unicode(results['release-group']['type'])
+                try:
+                    release['rg_type'] = unicode(results['release-group']['type'])
+                except KeyError:
+                    release['rg_type'] = u'Unknown'
             else:
                 logger.warn("Release " + releaseid + "had no ReleaseGroup associated")
 

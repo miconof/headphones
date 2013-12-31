@@ -9,11 +9,16 @@
 # Logs and databases #
 ######################
 *.log
-*.db
+*.db*
 *.db-journal
 *.ini
 logs/*
 cache/*
+
+# HTTPS Cert/Key #
+##################
+*.crt
+*.key
 
 # OS generated files #
 ######################
