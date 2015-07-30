@@ -13,108 +13,175 @@
 #  You should have received a copy of the GNU General Public License
 #  along with Headphones.  If not, see <http://www.gnu.org/licenses/>.
 
-import headphones
-from headphones import logger, notifiers
+from headphones import logger, request
 
-import urllib2
-import lib.simplejson as json
-import base64
 import time
+import json
+import base64
+import urlparse
+import headphones
 
 # This is just a simple script to send torrents to transmission. The
 # intention is to turn this into a class where we can check the state
-# of the download, set the download dir, etc. 
+# of the download, set the download dir, etc.
 # TODO: Store the session id so we don't need to make 2 calls
 #       Store torrent id so we can check up on it
 
+
 def addTorrent(link):
     method = 'torrent-add'
-    arguments = {'filename': link, 'download-dir':headphones.DOWNLOAD_TORRENT_DIR}
-    
-    response = torrentAction(method,arguments)
+
+    if link.endswith('.torrent'):
+        with open(link, 'rb') as f:
+            metainfo = str(base64.b64encode(f.read()))
+        arguments = {'metainfo': metainfo, 'download-dir': headphones.CONFIG.DOWNLOAD_TORRENT_DIR}
+    else:
+        arguments = {'filename': link, 'download-dir': headphones.CONFIG.DOWNLOAD_TORRENT_DIR}
+
+    response = torrentAction(method, arguments)
 
     if not response:
         return False
-        
-    if response['result'] == 'success':
-        name = response['arguments']['torrent-added']['name']
-        logger.info(u"Torrent sent to Transmission successfully")
-        if headphones.PROWL_ENABLED and headphones.PROWL_ONSNATCH:
-            logger.info(u"Sending Prowl notification")
-            prowl = notifiers.PROWL()
-            prowl.notify(name,"Download started")
-        if headphones.PUSHOVER_ENABLED and headphones.PUSHOVER_ONSNATCH:
-            logger.info(u"Sending Pushover notification")
-            prowl = notifiers.PUSHOVER()
-            prowl.notify(name,"Download started")
-        if headphones.NMA_ENABLED and headphones.NMA_ONSNATCH:
-            logger.debug(u"Sending NMA notification")
-            nma = notifiers.NMA()
-            nma.notify(snatched_nzb=name)
 
-        return response['arguments']['torrent-added']['id']
-        
+    if response['result'] == 'success':
+        if 'torrent-added' in response['arguments']:
+            retid = response['arguments']['torrent-added']['hashString']
+        elif 'torrent-duplicate' in response['arguments']:
+            retid = response['arguments']['torrent-duplicate']['hashString']
+        else:
+            retid = False
+
+        logger.info(u"Torrent sent to Transmission successfully")
+        return retid
+
+    else:
+        logger.info('Transmission returned status %s' % response['result'])
+        return False
+
+
 def getTorrentFolder(torrentid):
     method = 'torrent-get'
-    arguments = { 'ids': torrentid, 'fields': ['name','percentDone']}
-    
+    arguments = {'ids': torrentid, 'fields': ['name', 'percentDone']}
+
     response = torrentAction(method, arguments)
     percentdone = response['arguments']['torrents'][0]['percentDone']
     torrent_folder_name = response['arguments']['torrents'][0]['name']
-    
-    while percentdone == 0:
+
+    tries = 1
+
+    while percentdone == 0 and tries < 10:
+        tries += 1
         time.sleep(5)
         response = torrentAction(method, arguments)
         percentdone = response['arguments']['torrents'][0]['percentDone']
-    
+
     torrent_folder_name = response['arguments']['torrents'][0]['name']
 
     return torrent_folder_name
-    
+
+
+def setSeedRatio(torrentid, ratio):
+    method = 'torrent-set'
+    if ratio != 0:
+        arguments = {'seedRatioLimit': ratio, 'seedRatioMode': 1, 'ids': torrentid}
+    else:
+        arguments = {'seedRatioMode': 2, 'ids': torrentid}
+
+    response = torrentAction(method, arguments)
+    if not response:
+        return False
+
+
+def removeTorrent(torrentid, remove_data=False):
+
+    method = 'torrent-get'
+    arguments = {'ids': torrentid, 'fields': ['isFinished', 'name']}
+
+    response = torrentAction(method, arguments)
+    if not response:
+        return False
+
+    try:
+        finished = response['arguments']['torrents'][0]['isFinished']
+        name = response['arguments']['torrents'][0]['name']
+
+        if finished:
+            logger.info('%s has finished seeding, removing torrent and data' % name)
+            method = 'torrent-remove'
+            if remove_data:
+                arguments = {'delete-local-data': True, 'ids': torrentid}
+            else:
+                arguments = {'ids': torrentid}
+            response = torrentAction(method, arguments)
+            return True
+        else:
+            logger.info('%s has not finished seeding yet, torrent will not be removed, will try again on next run' % name)
+    except:
+        return False
+
+    return False
+
+
 def torrentAction(method, arguments):
-    
-    host = headphones.TRANSMISSION_HOST
-    username = headphones.TRANSMISSION_USERNAME
-    password = headphones.TRANSMISSION_PASSWORD
-    sessionid = None
-    
+
+    host = headphones.CONFIG.TRANSMISSION_HOST
+    username = headphones.CONFIG.TRANSMISSION_USERNAME
+    password = headphones.CONFIG.TRANSMISSION_PASSWORD
+
     if not host.startswith('http'):
         host = 'http://' + host
 
     if host.endswith('/'):
         host = host[:-1]
-	
-    host = host + "/transmission/rpc"
-    request = urllib2.Request(host)
-    if username and password:
-        base64string = base64.encodestring('%s:%s' % (username, password)).replace('\n', '')
-        request.add_header("Authorization", "Basic %s" % base64string)
-    opener = urllib2.build_opener()
-    try:
-        data = opener.open(request).read()
-    except urllib2.HTTPError, e:
-        if e.code == 409:
-            sessionid = e.hdrs['x-transmission-session-id']
+
+    # Fix the URL. We assume that the user does not point to the RPC endpoint,
+    # so add it if it is missing.
+    parts = list(urlparse.urlparse(host))
+
+    if not parts[0] in ("http", "https"):
+        parts[0] = "http"
+
+    if not parts[2].endswith("/rpc"):
+        parts[2] += "/transmission/rpc"
+
+    host = urlparse.urlunparse(parts)
+
+    # Retrieve session id
+    auth = (username, password) if username and password else None
+    response = request.request_response(host, auth=auth,
+        whitelist_status_code=[401, 409])
+
+    if response is None:
+        logger.error("Error gettings Transmission session ID")
+        return
+
+    # Parse response
+    if response.status_code == 401:
+        if auth:
+            logger.error("Username and/or password not accepted by " \
+                "Transmission")
         else:
-            logger.error('Could not connect to Transmission. Error: ' + str(e))
-    except Exception, e:
-        logger.error('Could not connect to Transmission. Error: ' + str(e))
-    
-    if not sessionid:
-        logger.error("Error getting Session ID from Transmission")
+            logger.error("Transmission authorization required")
+
         return
-        
-    request.add_header('x-transmission-session-id', sessionid)
-        
-    postdata = json.dumps({ 'method': method, 
-                       'arguments': arguments })
-                                      
-    request.add_data(postdata)
-                                      
-    try:    
-        response = json.loads(opener.open(request).read())
-    except Exception, e:
-        logger.error("Error sending torrent to Transmission: " + str(e))
+    elif response.status_code == 409:
+        session_id = response.headers['x-transmission-session-id']
+
+        if not session_id:
+            logger.error("Expected a Session ID from Transmission")
+            return
+
+    # Prepare next request
+    headers = {'x-transmission-session-id': session_id}
+    data = {'method': method, 'arguments': arguments}
+
+    response = request.request_json(host, method="POST", data=json.dumps(data),
+        headers=headers, auth=auth)
+
+    print response
+
+    if not response:
+        logger.error("Error sending torrent to Transmission")
         return
-        
+
     return response
